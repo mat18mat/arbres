@@ -94,11 +94,6 @@ def compute_insee_from_arrondissement(arr):
 
 
 def unify_paris(df):
-    """
-    En-tête Paris:
-    IDBASE;...;ARRONDISSEMENT;...;LIBELLE FRANCAIS;GENRE;ESPECE;...;CIRCONFERENCE (cm);HAUTEUR (m);...;REMARQUABLE;geo_point_2d
-    """
-    # Normalise colonnes (on garde les noms originaux en majuscules ici)
     out = []
 
     for _, r in df.iterrows():
@@ -113,15 +108,12 @@ def unify_paris(df):
             "localisation": {"lon": None, "lat": None},
         }
 
-        # commune = ARRONDISSEMENT (dans ton exemple ça peut être "BOIS DE VINCENNES")
         commune = r.get("ARRONDISSEMENT")
         if not pd.isna(commune):
             record["commune"] = str(commune).strip()
 
-        # code_insee calculé si arrondissement numérique (1..20)
         record["code_insee"] = compute_insee_from_arrondissement(r.get("ARRONDISSEMENT"))
 
-        # nom = LIBELLE FRANCAIS
         nom = r.get("LIBELLE FRANCAIS")
         if not pd.isna(nom):
             record["nom"] = str(nom).strip()
