@@ -1,197 +1,228 @@
 import json
-import os
 from pathlib import Path
-
 import pandas as pd
+import re
 
 
 RAW_DIR = Path("data-raw")
 OUT_DIR = Path("data")
 OUT_FILE = OUT_DIR / "arbres.json"
 
+# Tes fichiers (on s’adapte à ce que tu as)
+PARIS_FILE = RAW_DIR / "les-arbres.csv"
+HDS_FILE = RAW_DIR / "arbres-remarquables-du-territoire-des-hauts-de-seine-hors-proprietes-privees.csv"
 
-def guess_lat_lon(row: pd.Series) -> tuple[float | None, float | None]:
+
+def parse_geo_point_2d(val):
     """
-    Essaie de trouver latitude/longitude dans différentes colonnes possibles.
-    Retourne (lat, lon) ou (None, None).
+    Dans tes datasets, geo_point_2d ressemble souvent à: "48.8326, 2.41145"
+    => (lat, lon). On renvoie {"lon": ..., "lat": ...} comme sur la photo.
     """
-    # Cas fréquent: "geo_point_2d" = "48.8566, 2.3522"
-    for col in ["geo_point_2d", "geo_point", "geopoint", "coordonnees", "coordinates"]:
-        if col in row and pd.notna(row[col]):
-            val = str(row[col]).strip()
-            if "," in val:
-                parts = [p.strip() for p in val.split(",")]
-                if len(parts) >= 2:
-                    try:
-                        a = float(parts[0])
-                        b = float(parts[1])
-                        # Heuristique: si a ressemble à une latitude (≈ 48) et b à une longitude (≈ 2)
-                        # sinon on inverse.
-                        if -90 <= a <= 90 and -180 <= b <= 180:
-                            return a, b
-                        if -90 <= b <= 90 and -180 <= a <= 180:
-                            return b, a
-                    except ValueError:
-                        pass
+    if pd.isna(val):
+        return {"lon": None, "lat": None}
+    s = str(val).strip()
+    if not s:
+        return {"lon": None, "lat": None}
 
-    # Autres cas: colonnes séparées
-    lat_cols = ["lat", "latitude", "y_lat"]
-    lon_cols = ["lon", "lng", "longitude", "x_lon"]
-    lat = None
-    lon = None
-    for c in lat_cols:
-        if c in row and pd.notna(row[c]):
-            try:
-                lat = float(row[c])
-                break
-            except ValueError:
-                pass
-    for c in lon_cols:
-        if c in row and pd.notna(row[c]):
-            try:
-                lon = float(row[c])
-                break
-            except ValueError:
-                pass
+    # parfois séparateur virgule
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) < 2:
+        return {"lon": None, "lat": None}
 
-    return lat, lon
+    try:
+        a = float(parts[0].replace(",", "."))
+        b = float(parts[1].replace(",", "."))
+    except ValueError:
+        return {"lon": None, "lat": None}
+
+    # Heuristique: si a ressemble à une latitude (≈48) et b à une longitude (≈2)
+    # alors a=lat, b=lon. Sinon on inverse.
+    if -90 <= a <= 90 and -180 <= b <= 180:
+        lat, lon = a, b
+    else:
+        lon, lat = a, b
+
+    return {"lon": lon, "lat": lat}
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    return df
+def to_float(val):
+    if pd.isna(val):
+        return None
+    try:
+        return float(str(val).replace(",", ".").strip())
+    except ValueError:
+        return None
 
 
-def to_common_format(df: pd.DataFrame, source: str) -> list[dict]:
+def circonference_to_m(val):
     """
-    Transforme un DataFrame (peu importe son schéma) en liste de dicts homogènes.
-    On garde le max d'infos utiles + geo si dispo.
+    Photo: circonference = 3.05 (m) alors que Paris donne CIRCONFERENCE (cm).
+    Donc:
+    - Si valeur > 20, on suppose que c'est en cm -> /100
+    - Sinon on la garde (déjà en m)
     """
-    df = normalize_columns(df)
+    x = to_float(val)
+    if x is None:
+        return None
+    if x > 20:  # probablement cm
+        return round(x / 100.0, 2)
+    return round(x, 2)
 
-    # champs "communs" possibles
-    possible_city = ["commune", "ville", "arrondissement", "localite"]
-    possible_addr = ["adresse", "address", "lieu", "libellefrancais", "libelléfrancais"]
-    possible_species = ["espece", "espèce", "species", "libellefrancais", "libelléfrancais", "genre", "variete", "variété"]
-    possible_id = ["id", "objectid", "gid", "identifiant", "id_arbre", "idbase"]
 
+def compute_insee_from_arrondissement(arr):
+    """
+    Gère :
+    - "14" → 75114
+    - "PARIS 14E ARRDT" → 75114
+    - "PARIS 7E ARRDT" → 75107
+    Sinon None
+    """
+    if pd.isna(arr):
+        return None
+
+    s = str(arr).strip().upper()
+
+    # cherche un nombre entre 1 et 20 dans la chaîne
+    m = re.search(r"\b([1-9]|1\d|20)\b", s)
+    if not m:
+        return None
+
+    n = int(m.group(1))
+    return f"751{n:02d}"
+
+
+
+
+def unify_paris(df):
+    """
+    En-tête Paris:
+    IDBASE;...;ARRONDISSEMENT;...;LIBELLE FRANCAIS;GENRE;ESPECE;...;CIRCONFERENCE (cm);HAUTEUR (m);...;REMARQUABLE;geo_point_2d
+    """
+    # Normalise colonnes (on garde les noms originaux en majuscules ici)
     out = []
-    for _, row in df.iterrows():
-        obj = {
-            "source": source,
-            "id_source": None,
+
+    for _, r in df.iterrows():
+        record = {
+            "source": "paris",
             "commune": None,
-            "adresse": None,
-            "espece": None,
-            "hauteur_m": None,
-            "circonference_cm": None,
-            "remarquable": None,
-            "geo": {"lat": None, "lon": None},
-            "raw": {},  # on garde aussi les champs originaux (utile pour le TP)
+            "code_insee": None,
+            "nom": None,
+            "latin": None,
+            "hauteur": None,
+            "circonference": None,
+            "localisation": {"lon": None, "lat": None},
         }
 
-        # id_source
-        for c in possible_id:
-            c = c.lower()
-            if c in df.columns and pd.notna(row.get(c)):
-                obj["id_source"] = str(row.get(c))
-                break
+        # commune = ARRONDISSEMENT (dans ton exemple ça peut être "BOIS DE VINCENNES")
+        commune = r.get("ARRONDISSEMENT")
+        if not pd.isna(commune):
+            record["commune"] = str(commune).strip()
+
+        # code_insee calculé si arrondissement numérique (1..20)
+        record["code_insee"] = compute_insee_from_arrondissement(r.get("ARRONDISSEMENT"))
+
+        # nom = LIBELLE FRANCAIS
+        nom = r.get("LIBELLE FRANCAIS")
+        if not pd.isna(nom):
+            record["nom"] = str(nom).strip()
+
+        # latin = "GENRE ESPECE" (ex: Taxodium distichum)
+        genre = r.get("GENRE")
+        espece = r.get("ESPECE")
+        g = "" if pd.isna(genre) else str(genre).strip()
+        e = "" if pd.isna(espece) else str(espece).strip()
+        latin = (g + " " + e).strip()
+        record["latin"] = latin if latin else None
+
+        # hauteur = HAUTEUR (m)
+        record["hauteur"] = to_float(r.get("HAUTEUR (m)"))
+
+        # circonference en mètres (photo)
+        record["circonference"] = circonference_to_m(r.get("CIRCONFERENCE (cm)"))
+
+        # localisation
+        record["localisation"] = parse_geo_point_2d(r.get("geo_point_2d"))
+
+        out.append(record)
+
+    return out
+
+
+def unify_hds(df):
+    """
+    En-tête HDS:
+    COMMUNE;DOMAINE;CODE_INSEE;...;NOM_FRANCAIS;NOM_LATIN;...;HAUTEUR;CIRCONFERENCE;...;geo_point_2d
+    """
+    out = []
+
+    for _, r in df.iterrows():
+        record = {
+            "source": "hauts-de-seine",
+            "commune": None,
+            "code_insee": None,
+            "nom": None,
+            "latin": None,
+            "hauteur": None,
+            "circonference": None,
+            "localisation": {"lon": None, "lat": None},
+        }
 
         # commune
-        for c in possible_city:
-            c = c.lower()
-            if c in df.columns and pd.notna(row.get(c)):
-                obj["commune"] = str(row.get(c))
-                break
+        commune = r.get("COMMUNE")
+        if not pd.isna(commune):
+            record["commune"] = str(commune).strip()
 
-        # adresse
-        for c in possible_addr:
-            c = c.lower()
-            if c in df.columns and pd.notna(row.get(c)):
-                obj["adresse"] = str(row.get(c))
-                break
+        # code_insee (déjà fourni)
+        ci = r.get("CODE_INSEE")
+        if not pd.isna(ci):
+            record["code_insee"] = str(ci).strip()
 
-        # espece (on concatène si possible)
-        parts = []
-        for c in possible_species:
-            c = c.lower()
-            if c in df.columns and pd.notna(row.get(c)):
-                val = str(row.get(c)).strip()
-                if val and val not in parts:
-                    parts.append(val)
-        if parts:
-            obj["espece"] = " / ".join(parts[:3])
+        # nom / latin
+        nf = r.get("NOM_FRANCAIS")
+        if not pd.isna(nf):
+            record["nom"] = str(nf).strip()
 
-        # hauteur / circonférence si on les trouve
-        for c in ["hauteur", "hauteur_m", "hauteur(en m)", "hauteur_metre", "hauteurmetre"]:
-            c = c.lower()
-            if c in df.columns and pd.notna(row.get(c)):
-                try:
-                    obj["hauteur_m"] = float(str(row.get(c)).replace(",", "."))
-                    break
-                except ValueError:
-                    pass
+        nl = r.get("NOM_LATIN")
+        if not pd.isna(nl):
+            record["latin"] = str(nl).strip()
 
-        for c in ["circonference", "circonférence", "circonference_cm", "circonférence_cm"]:
-            c = c.lower()
-            if c in df.columns and pd.notna(row.get(c)):
-                try:
-                    obj["circonference_cm"] = float(str(row.get(c)).replace(",", "."))
-                    break
-                except ValueError:
-                    pass
+        # hauteur / circonference (souvent en m, mais on sécurise)
+        record["hauteur"] = to_float(r.get("HAUTEUR"))
+        record["circonference"] = circonference_to_m(r.get("CIRCONFERENCE"))
 
-        # remarquable (si la colonne existe)
-        for c in ["remarquable", "est_remarquable", "classement", "statut"]:
-            c = c.lower()
-            if c in df.columns and pd.notna(row.get(c)):
-                v = str(row.get(c)).strip().lower()
-                obj["remarquable"] = v in ["1", "true", "oui", "yes", "vrai"]
-                break
+        # localisation
+        record["localisation"] = parse_geo_point_2d(r.get("geo_point_2d"))
 
-        # geo
-        lat, lon = guess_lat_lon(row)
-        obj["geo"]["lat"] = lat
-        obj["geo"]["lon"] = lon
-
-        # raw (tout le reste)
-        obj["raw"] = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
-
-        out.append(obj)
+        out.append(record)
 
     return out
 
 
 def main():
-    paris_file = RAW_DIR / "les-arbres.csv"
-    hds_file = RAW_DIR / "arbres-remarquables-du-territoire-des-hauts-de-seine-hors-proprietes-privees.csv"
+    if not PARIS_FILE.exists():
+        raise FileNotFoundError(f"Fichier manquant: {PARIS_FILE}")
+    if not HDS_FILE.exists():
+        raise FileNotFoundError(f"Fichier manquant: {HDS_FILE}")
 
+    # CSV avec ';' (vu dans tes en-têtes)
+    df_paris = pd.read_csv(PARIS_FILE, sep=";", engine="python", encoding="latin-1")
+    df_hds = pd.read_csv(HDS_FILE, sep=";", engine="python")
 
-    if not paris_file.exists():
-        raise FileNotFoundError(f"Fichier manquant: {paris_file}")
-    if not hds_file.exists():
-        raise FileNotFoundError(f"Fichier manquant: {hds_file}")
-
-    # Lecture CSV (séparateur automatique)
-    df_paris = pd.read_csv(paris_file, sep=None, engine="python")
-    df_hds = pd.read_csv(hds_file, sep=None, engine="python")
-
-    # Important: Paris -> on ne garde que remarquables si une colonne le permet
-    tmp = normalize_columns(df_paris)
-    if "remarquable" in tmp.columns:
-        df_paris = tmp[tmp["remarquable"].astype(str).str.lower().isin(["1", "true", "oui", "yes"])]
+    # (Option) Si tu veux vraiment garder uniquement les remarquables côté Paris:
+    # REMARQUABLE = "OUI" (dans ton header c’est REMARQUABLE)
+    if "REMARQUABLE" in df_paris.columns:
+        df_paris = df_paris[df_paris["REMARQUABLE"].astype(str).str.upper().isin(["OUI", "TRUE", "1"])]
 
     OUT_DIR.mkdir(exist_ok=True)
 
-    all_records = []
-    all_records.extend(to_common_format(df_paris, "paris"))
-    all_records.extend(to_common_format(df_hds, "hauts-de-seine"))
+    records = []
+    records.extend(unify_paris(df_paris))
+    records.extend(unify_hds(df_hds))
 
     with open(OUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_records, f, ensure_ascii=False, indent=2)
+        json.dump(records, f, ensure_ascii=False, indent=2)
 
-    print(f"OK -> {OUT_FILE} ({len(all_records)} enregistrements)")
+    print(f"OK -> {OUT_FILE} ({len(records)} enregistrements)")
 
 
 if __name__ == "__main__":
